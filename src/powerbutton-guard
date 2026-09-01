@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""powerbutton-guard - require a deliberate pattern to power off.
+
+systemd-logind's default is HandlePowerKey=poweroff: one brief, accidental
+brush of the power button and the machine goes down instantly. This daemon
+takes ownership of the button instead (logind is set to ignore it) and
+demands a deliberate gesture:
+
+    tap                     -> arms for ARM_WINDOW seconds, does nothing else
+    tap tap (within window) -> starts a cancellable shutdown
+    tap (during countdown)  -> cancels it
+
+Feedback is deliberately non-audio: many small/headless machines have no
+buzzer and no speakers. A keyboard LED blinks, a message goes to the
+console TTY, and wall(1) reaches logged-in sessions.
+
+Configuration comes from the environment - see /etc/default/powerbutton-guard.
+"""
+import glob, os, select, struct, subprocess, sys, time
+
+EVENT_FMT = 'llHHi'
+EVENT_SIZE = struct.calcsize(EVENT_FMT)
+EV_KEY, KEY_POWER = 0x01, 116
+
+SCHEDULED = '/run/systemd/shutdown/scheduled'
+DEBOUNCE = 0.4          # one physical press can surface on several ACPI devices
+
+
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, '') or default)
+    except ValueError:
+        return default
+
+
+def env_int(name, default):
+    try:
+        return int(os.environ.get(name, '') or default)
+    except ValueError:
+        return default
+
+
+ARM_WINDOW = env_float('ARM_WINDOW', 2.0)
+GRACE_MIN = env_int('GRACE_MINUTES', 1)
+NOTIFY_TTY = os.environ.get('NOTIFY_TTY', '/dev/tty1')
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def find_led():
+    """LED_PATH may be an explicit path, or 'none' to disable, or unset/'auto'.
+
+    Autodetection prefers scroll lock: nothing else uses it, so blinking it
+    cannot be mistaken for a real caps/num lock state change.
+    """
+    want = (os.environ.get('LED_PATH') or 'auto').strip()
+    if want.lower() == 'none':
+        return None
+    if want.lower() != 'auto':
+        return want
+    for pattern in ('*::scrolllock', '*::capslock', '*::numlock'):
+        for path in sorted(glob.glob('/sys/class/leds/' + pattern)):
+            candidate = os.path.join(path, 'brightness')
+            if os.access(candidate, os.W_OK):
+                return candidate
+    return None
+
+
+LED = find_led()
+
+
+def led(on):
+    if not LED:
+        return
+    try:
+        with open(LED, 'w') as f:
+            f.write('1' if on else '0')
+    except OSError:
+        pass
+
+
+def blink(times, on=0.12, off=0.12):
+    for _ in range(times):
+        led(True); time.sleep(on)
+        led(False); time.sleep(off)
+
+
+def shutdown_pending():
+    """Authoritative. systemd writes this file while a shutdown is scheduled.
+
+    Deliberately NOT cached in a variable: a `shutdown -c` issued from an SSH
+    session or a cron job would leave a cached flag stale, and the next button
+    press would be silently swallowed as a redundant cancel.
+    """
+    return os.path.exists(SCHEDULED)
+
+
+def notify(msg):
+    """Best effort on every channel; none of them is required to succeed."""
+    if NOTIFY_TTY and NOTIFY_TTY.lower() != 'none':
+        try:
+            with open(NOTIFY_TTY, 'w') as t:
+                t.write('\n[power button] ' + msg + '\n')
+        except OSError:
+            pass
+    subprocess.run(['wall', '-n', '[power button] ' + msg],
+                   stderr=subprocess.DEVNULL, check=False)
+
+
+def button_devices():
+    found = []
+    for path in sorted(glob.glob('/dev/input/event*')):
+        try:
+            fd = open(path, 'rb', buffering=0)
+        except OSError:
+            continue
+        name = ''
+        try:
+            with open('/sys/class/input/%s/device/name'
+                      % os.path.basename(path)) as n:
+                name = n.read().strip()
+        except OSError:
+            pass
+        if name == 'Power Button':
+            found.append(fd)
+            log('watching %s (%s)' % (path, name))
+        else:
+            fd.close()
+    return found
+
+
+def main():
+    log('config: ARM_WINDOW=%.1fs GRACE_MINUTES=%d LED=%s TTY=%s'
+        % (ARM_WINDOW, GRACE_MIN, LED or 'disabled', NOTIFY_TTY or 'disabled'))
+    devices = button_devices()
+    if not devices:
+        log('ERROR: no input device named "Power Button" found')
+        return 1
+    fds = {fd.fileno(): fd for fd in devices}
+
+    armed_until = 0.0
+    last_press = 0.0
+
+    while True:
+        timeout = None
+        if armed_until:
+            timeout = max(0.05, armed_until - time.monotonic())
+        ready, _, _ = select.select(list(fds), [], [], timeout)
+
+        now = time.monotonic()
+        pressed = False
+        for fileno in ready:
+            data = fds[fileno].read(EVENT_SIZE)
+            if not data or len(data) < EVENT_SIZE:
+                continue
+            _, _, etype, code, value = struct.unpack(EVENT_FMT, data)
+            if etype == EV_KEY and code == KEY_POWER and value == 1:
+                pressed = True
+
+        if pressed:
+            if now - last_press < DEBOUNCE:
+                continue            # same physical press seen on another device
+            last_press = now
+
+            if shutdown_pending():
+                subprocess.run(['shutdown', '-c'], check=False)
+                armed_until = 0.0
+                led(False)
+                notify('shutdown CANCELLED')
+                log('cancelled')
+                blink(2)
+            elif armed_until and now < armed_until:
+                armed_until = 0.0
+                notify('shutting down in %d minute(s) - press the button again '
+                       'or run "shutdown -c" to cancel' % GRACE_MIN)
+                log('confirmed -> shutdown -h +%d' % GRACE_MIN)
+                subprocess.run(['shutdown', '-h', '+%d' % GRACE_MIN],
+                               check=False)
+                blink(6, 0.08, 0.08)
+            else:
+                armed_until = now + ARM_WINDOW
+                notify('press again within %.0fs to shut down' % ARM_WINDOW)
+                log('armed')
+                blink(1, 0.25, 0.1)
+
+        elif armed_until and now >= armed_until:
+            armed_until = 0.0
+            log('disarmed')
+            led(False)
+
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        led(False)
+        sys.exit(0)

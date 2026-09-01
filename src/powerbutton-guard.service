@@ -1,0 +1,25 @@
+[Unit]
+Description=Power button guard (deliberate pattern required to power off)
+Documentation=https://github.com/kreuzhofer/powerbutton-guard
+After=systemd-logind.service
+Wants=systemd-logind.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/powerbutton-guard
+ExecStart=/usr/local/sbin/powerbutton-guard
+Restart=always
+RestartSec=2
+
+# Needs root: reads /dev/input/event* and calls shutdown(8).
+# ProtectSystem=strict leaves /dev, /proc and /sys writable, which is what the
+# keyboard-LED feedback needs; everything else is read-only.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# Configuration for powerbutton-guard.service
+# Edit, then: sudo systemctl restart powerbutton-guard
+
+# Seconds allowed between the first and second press.
+ARM_WINDOW=2.0
+
+# Minutes of cancellable grace before the machine actually powers off.
+# Cancel with another button press, or `sudo shutdown -c`.
+GRACE_MINUTES=1
+
+# Keyboard LED used for visual feedback.
+#   auto  - first available scrolllock, then capslock, then numlock
+#   none  - disable LED feedback
+#   /sys/class/leds/<name>/brightness - use this one explicitly
+LED_PATH=auto
+
+# Console TTY that status messages are written to, or `none` to disable.
+# wall(1) is always used in addition, so SSH sessions see the messages too.
+NOTIFY_TTY=/dev/tty1
